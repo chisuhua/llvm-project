@@ -1,0 +1,10 @@
+#include "OPU.h"
+#include "OPUSubtarget.h"
+#include "OPUInstrInfo.h"
+#include "MCTargetDesc/OPUMCTargetDesc.h"
+#include "OPUMachineFunction.h"
+#include "OPURegisterInfo.h"
+#include "OPUResourceInfoAnalysis.h"
+#include "llvm/CodeGen/MachineFunctionPass.h"
+#include "llvm/InitializePasses.h"
+
