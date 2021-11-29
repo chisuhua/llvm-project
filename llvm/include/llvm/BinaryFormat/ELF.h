@@ -315,6 +315,7 @@ enum {
   EM_AMDGPU = 224,        // AMD GPU architecture
   EM_RISCV = 243,         // RISC-V
   EM_LANAI = 244,         // Lanai 32-bit processor
+  EM_OPU = 245,           // OPU
   EM_BPF = 247,           // Linux kernel bpf virtual machine
   EM_VE = 251,            // NEC SX-Aurora VE
   EM_CSKY = 252,          // C-SKY 32-bit processor
@@ -656,6 +657,11 @@ enum : unsigned {
 // ELF Relocation types for RISC-V
 enum {
 #include "ELFRelocs/RISCV.def"
+};
+
+// ELF Relocation types for OPU
+enum {
+#include "ELFRelocs/OPU.def"
 };
 
 // ELF Relocation types for S390/zSeries

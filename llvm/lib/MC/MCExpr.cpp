@@ -365,6 +365,14 @@ StringRef MCSymbolRefExpr::getVariantKindName(VariantKind Kind) {
   case VK_AMDGPU_REL64: return "rel64";
   case VK_AMDGPU_ABS32_LO: return "abs32@lo";
   case VK_AMDGPU_ABS32_HI: return "abs32@hi";
+  case VK_OPU_GOTPCREL32_LO: return "gotpcrel32@lo";
+  case VK_OPU_GOTPCREL32_HI: return "gotpcrel32@hi";
+  case VK_OPU_REL64: return "rel64";
+  case VK_OPU_REL32_LO: return "rel32@lo";
+  case VK_OPU_REL32_HI: return "rel32@hi";
+  case VK_OPU_PCREL32_LO: return "pcrel32@lo";
+  case VK_OPU_PCREL32_HI: return "pcrel32@hi";
+  case VK_OPU_PCREL_CALL: return "pcrel@call";
   case VK_VE_HI32: return "hi";
   case VK_VE_LO32: return "lo";
   case VK_VE_PC_HI32: return "pc_hi";
@@ -506,6 +514,13 @@ MCSymbolRefExpr::getVariantKindForName(StringRef Name) {
     .Case("rel64", VK_AMDGPU_REL64)
     .Case("abs32@lo", VK_AMDGPU_ABS32_LO)
     .Case("abs32@hi", VK_AMDGPU_ABS32_HI)
+    .Case("gotpcrel32@lo", VK_OPU_GOTPCREL32_LO)
+    .Case("gotpcrel32@hi", VK_OPU_GOTPCREL32_HI)
+    .Case("rel32@lo", VK_OPU_REL32_LO)
+    .Case("rel32@hi", VK_OPU_REL32_HI)
+    .Case("pcrel32@lo", VK_OPU_PCREL32_LO)
+    .Case("pcrel32@hi", VK_OPU_PCREL32_HI)
+    .Case("pcrel@call", VK_OPU_PCREL_CALL)
     .Case("hi", VK_VE_HI32)
     .Case("lo", VK_VE_LO32)
     .Case("pc_hi", VK_VE_PC_HI32)

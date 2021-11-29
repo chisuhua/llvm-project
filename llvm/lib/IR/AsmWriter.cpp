@@ -401,6 +401,8 @@ static void PrintCallingConv(unsigned cc, raw_ostream &Out) {
   case CallingConv::AMDGPU_CS:     Out << "amdgpu_cs"; break;
   case CallingConv::AMDGPU_KERNEL: Out << "amdgpu_kernel"; break;
   case CallingConv::AMDGPU_Gfx:    Out << "amdgpu_gfx"; break;
+  case CallingConv::OPU_KERNEL:    Out << "opu_kernel"; break;
+  case CallingConv::OPU_DEVICE:    Out << "opu_device"; break;
   }
 }
 

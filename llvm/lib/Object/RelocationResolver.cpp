@@ -255,6 +255,43 @@ static uint64_t resolveAmdgpu(uint64_t Type, uint64_t Offset, uint64_t S,
   }
 }
 
+static bool supportsOpu(uint64_t Type) {
+  switch (Type) {
+  case ELF::R_OPU_GOTPCREL32_LO:
+  case ELF::R_OPU_GOTPCREL32_HI:
+  case ELF::R_OPU_REL32_LO:
+  case ELF::R_OPU_REL32_HI:
+  case ELF::R_OPU_PCREL32:
+  case ELF::R_OPU_PCREL32_LO:
+  case ELF::R_OPU_PCREL32_HI:
+  case ELF::R_OPU_ABS32:
+  case ELF::R_OPU_ABS64:
+    return true;
+  default:
+    return false;
+  }
+}
+
+static uint64_t resolveAmdgpu(RelocationRef R, uint64_t S, uint64_t A) {
+  int64_t RA = getELFAddend(R);
+  switch (R.getType()) {
+  case ELF::R_OPU_GOTPCREL32_LO:
+  case ELF::R_OPU_GOTPCREL32_HI:
+  case ELF::R_OPU_REL32_LO:
+  case ELF::R_OPU_REL32_HI:
+    return RA;
+  case ELF::R_OPU_PCREL32:
+  case ELF::R_OPU_PCREL32_LO:
+  case ELF::R_OPU_PCREL32_HI:
+    return S + RA - R.getOffset();
+  case ELF::R_OPU_ABS32:
+  case ELF::R_OPU_ABS64:
+    return S + RA;
+  default:
+    llvm_unreachable("Invalid relocation type");
+  }
+}
+
 static bool supportsX86(uint64_t Type) {
   switch (Type) {
   case ELF::R_386_NONE:

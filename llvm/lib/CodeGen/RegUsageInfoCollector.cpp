@@ -92,6 +92,7 @@ static bool isCallableFunction(const MachineFunction &MF) {
   case CallingConv::AMDGPU_ES:
   case CallingConv::AMDGPU_LS:
   case CallingConv::AMDGPU_KERNEL:
+  case CallingConv::OPU_KERNEL:
     return false;
   default:
     return true;

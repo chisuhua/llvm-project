@@ -178,6 +178,9 @@ const char kAsanAllocasUnpoison[] = "__asan_allocas_unpoison";
 const char kAMDGPUAddressSharedName[] = "llvm.amdgcn.is.shared";
 const char kAMDGPUAddressPrivateName[] = "llvm.amdgcn.is.private";
 
+const char kOPUAddressSharedName[] = "llvm.opu.is.shared";
+const char kOPUAddressPrivateName[] = "llvm.opu.is.private";
+
 // Accesses sizes are powers of two: 1, 2, 4, 8, 16.
 static const size_t kNumberOfAccessSizes = 5;
 
@@ -479,9 +482,13 @@ static ShadowMapping getShadowMapping(Triple &TargetTriple, int LongSize,
   bool IsMyriad = TargetTriple.getVendor() == llvm::Triple::Myriad;
   bool IsEmscripten = TargetTriple.isOSEmscripten();
   bool IsAMDGPU = TargetTriple.isAMDGPU();
+  bool IsOPU = TargetTriple.isOPU();
 
   // Asan support for AMDGPU assumes X86 as the host right now.
   if (IsAMDGPU)
+    IsX86_64 = true;
+
+  if (IsOPU)
     IsX86_64 = true;
 
   ShadowMapping Mapping;
@@ -675,6 +682,12 @@ struct AddressSanitizer {
                                        Instruction *InsertBefore, Value *Addr,
                                        uint32_t TypeSize, bool IsWrite,
                                        Value *SizeArgument);
+
+  Instruction *instrumentOPUAddress(Instruction *OrigIns,
+                                       Instruction *InsertBefore, Value *Addr,
+                                       uint32_t TypeSize, bool IsWrite,
+                                       Value *SizeArgument);
+
   void instrumentUnusualSizeOrAlignment(Instruction *I,
                                         Instruction *InsertBefore, Value *Addr,
                                         uint32_t TypeSize, bool IsWrite,
@@ -746,6 +759,9 @@ private:
 
   FunctionCallee AMDGPUAddressShared;
   FunctionCallee AMDGPUAddressPrivate;
+
+  FunctionCallee OPUAddressShared;
+  FunctionCallee OPUAddressPrivate;
 };
 
 class AddressSanitizerLegacyPass : public FunctionPass {
@@ -976,7 +992,8 @@ struct FunctionStackPoisoner : public InstVisitor<FunctionStackPoisoner> {
         IntptrPtrTy(PointerType::get(IntptrTy, 0)), Mapping(ASan.Mapping),
         StackAlignment(1 << Mapping.Scale),
         PoisonStack(ClStack &&
-                    !Triple(F.getParent()->getTargetTriple()).isAMDGPU()) {}
+                    !Triple(F.getParent()->getTargetTriple()).isAMDGPU() &&
+                    !Triple(F.getParent()->getTargetTriple()).isOPU()) {}
 
   bool runOnFunction() {
     if (!PoisonStack)
@@ -1355,6 +1372,14 @@ static bool isUnsupportedAMDGPUAddrspace(Value *Addr) {
   return false;
 }
 
+static bool isUnsupportedOPUAddrspace(Value *Addr) {
+  Type *PtrTy = cast<PointerType>(Addr->getType()->getScalarType());
+  unsigned int AddrSpace = PtrTy->getPointerAddressSpace();
+  if (AddrSpace == 3 || AddrSpace == 5)
+    return true;
+  return false;
+}
+
 Value *AddressSanitizer::memToShadow(Value *Shadow, IRBuilder<> &IRB) {
   // Shadow >> scale
   Shadow = IRB.CreateLShr(Shadow, Mapping.Scale);
@@ -1418,7 +1443,8 @@ bool AddressSanitizer::ignoreAccess(Value *Ptr) {
   // Instrument acesses from different address spaces only for AMDGPU.
   Type *PtrTy = cast<PointerType>(Ptr->getType()->getScalarType());
   if (PtrTy->getPointerAddressSpace() != 0 &&
-      !(TargetTriple.isAMDGPU() && !isUnsupportedAMDGPUAddrspace(Ptr)))
+      !(TargetTriple.isAMDGPU() && !isUnsupportedAMDGPUAddrspace(Ptr)) &&
+      !(TargetTriple.isOPU() && !isUnsupportedOPUAddrspace(Ptr)))
     return true;
 
   // Ignore swifterror addresses.
@@ -1735,6 +1761,29 @@ Instruction *AddressSanitizer::instrumentAMDGPUAddress(
   return InsertBefore;
 }
 
+Instruction *AddressSanitizer::instrumentOPUAddress(
+    Instruction *OrigIns, Instruction *InsertBefore, Value *Addr,
+    uint32_t TypeSize, bool IsWrite, Value *SizeArgument) {
+  // Do not instrument unsupported addrspaces.
+  if (isUnsupportedOPUAddrspace(Addr))
+    return nullptr;
+  Type *PtrTy = cast<PointerType>(Addr->getType()->getScalarType());
+  // Follow host instrumentation for global and constant addresses.
+  if (PtrTy->getPointerAddressSpace() != 0)
+    return InsertBefore;
+  // Instrument generic addresses in supported addressspaces.
+  IRBuilder<> IRB(InsertBefore);
+  Value *AddrLong = IRB.CreatePointerCast(Addr, IRB.getInt8PtrTy());
+  Value *IsShared = IRB.CreateCall(OPUAddressShared, {AddrLong});
+  Value *IsPrivate = IRB.CreateCall(OPUAddressPrivate, {AddrLong});
+  Value *IsSharedOrPrivate = IRB.CreateOr(IsShared, IsPrivate);
+  Value *Cmp = IRB.CreateICmpNE(IRB.getTrue(), IsSharedOrPrivate);
+  Value *AddrSpaceZeroLanding =
+      SplitBlockAndInsertIfThen(Cmp, InsertBefore, false);
+  InsertBefore = cast<Instruction>(AddrSpaceZeroLanding);
+  return InsertBefore;
+}
+
 void AddressSanitizer::instrumentAddress(Instruction *OrigIns,
                                          Instruction *InsertBefore, Value *Addr,
                                          uint32_t TypeSize, bool IsWrite,
@@ -1744,6 +1793,13 @@ void AddressSanitizer::instrumentAddress(Instruction *OrigIns,
 
   if (TargetTriple.isAMDGPU()) {
     InsertBefore = instrumentAMDGPUAddress(OrigIns, InsertBefore, Addr,
+                                           TypeSize, IsWrite, SizeArgument);
+    if (!InsertBefore)
+      return;
+  }
+
+  if (TargetTriple.isOPU()) {
+    InsertBefore = instrumentOPUAddress(OrigIns, InsertBefore, Addr,
                                            TypeSize, IsWrite, SizeArgument);
     if (!InsertBefore)
       return;
@@ -1917,7 +1973,8 @@ bool ModuleAddressSanitizer::shouldInstrumentGlobal(GlobalVariable *G) const {
   if (!G->hasInitializer()) return false;
   // Globals in address space 1 and 4 are supported for AMDGPU.
   if (G->getAddressSpace() &&
-      !(TargetTriple.isAMDGPU() && !isUnsupportedAMDGPUAddrspace(G)))
+      !(TargetTriple.isAMDGPU() && !isUnsupportedAMDGPUAddrspace(G)) &&
+      !(TargetTriple.isOPU() && !isUnsupportedOPUAddrspace(G)))
     return false;
   if (GlobalWasGeneratedByCompiler(G)) return false; // Our own globals.
   // Two problems with thread-locals:
@@ -2716,6 +2773,12 @@ void AddressSanitizer::initializeCallbacks(Module &M) {
       kAMDGPUAddressSharedName, IRB.getInt1Ty(), IRB.getInt8PtrTy());
   AMDGPUAddressPrivate = M.getOrInsertFunction(
       kAMDGPUAddressPrivateName, IRB.getInt1Ty(), IRB.getInt8PtrTy());
+
+  OPUAddressShared = M.getOrInsertFunction(
+      kOPUAddressSharedName, IRB.getInt1Ty(), IRB.getInt8PtrTy());
+  OPUAddressPrivate = M.getOrInsertFunction(
+      kOPUAddressPrivateName, IRB.getInt1Ty(), IRB.getInt8PtrTy());
+
 }
 
 bool AddressSanitizer::maybeInsertAsanInitAtFunctionEntry(Function &F) {

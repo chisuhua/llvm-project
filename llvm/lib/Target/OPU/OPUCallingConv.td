@@ -24,6 +24,12 @@ class CCIfNotSimtBranch<CCAction A>
   : CCIf<"static_cast<const OPUTargetMachine&>"
   "(State.getMachineFunction().getTarget()).EnableSimtBranch", A>;
 
+// variable arg
+def CC_OPU_VarArg : CallingConv<[
+	CCIfType<[i32, f32, i16, f16, i1, i8], CCAssignToStack<4, 4>>,
+	CCIfType<[i64, f64], CCAssignToStack<8, 4>>
+]>;
+
 // Calling convention for leaf functions
 let Entry = 1 in
 def CC_OPU_Func : CallingConv<[

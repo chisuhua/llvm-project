@@ -279,6 +279,28 @@ unsigned getSLDCntBitMask() {
 }
 unsigned getSLDCntEnBitShift() { return 50; }
 
+bool isEntryFunctionCC(CallingConv::ID CC) {
+  switch (CC) {
+  case CallingConv::OPU_KERNEL:
+  case CallingConv::SPIR_KERNEL:
+  case CallingConv::PTX_KERNEL:
+    return true;
+  default:
+    return false;
+  }
+}
+
+bool isKernel(CallingConv::ID CC) {
+  switch (CC) {
+  case CallingConv::OPU_KERNEL:
+  case CallingConv::SPIR_KERNEL:
+  case CallingConv::PTX_KERNEL:
+  // case CallingConv::AMDGPU_CS:
+    return true;
+  default:
+    return false;
+  }
+
 }
 } // llvm
 

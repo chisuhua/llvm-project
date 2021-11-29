@@ -610,3 +610,35 @@ bool OPUCallLowering::lowerFormalArguments(
 
   return true;
 }
+
+bool OPUCallLowering::CCAssignFnForCall(CallingConv::ID CC, bool IsVarArg) const {
+  switch (CC) {
+    case CallingConv::OPU_KERNEL:
+    case CallingConv::PTX_KERNEL:
+        llvm_unreachable("kernels should not be handled here");
+    case CallingConv::OPU_DEVICE:
+    case CallingConv::PTX_DEVICE:
+    case CallingConv::C:
+    case CallingConv::Fast:
+    case CallingConv::Cold:
+        return CC_OPU_Func;
+    default:
+        report_fatal_error("Unsupported calling convention");
+  }
+}
+
+bool OPUCallLowering::CCAssignFnForReturn(CallingConv::ID CC, bool IsVarArg) const {
+  switch (CC) {
+    case CallingConv::OPU_KERNEL:
+    case CallingConv::PTX_KERNEL:
+        llvm_unreachable("kernels should not be handled here");
+    case CallingConv::OPU_DEVICE:
+    case CallingConv::PTX_DEVICE:
+    case CallingConv::C:
+    case CallingConv::Fast:
+    case CallingConv::Cold:
+        return RetCC_OPU_Func;
+    default:
+        report_fatal_error("Unsupported calling convention");
+  }
+}

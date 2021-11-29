@@ -1197,6 +1197,8 @@ StringRef ELFObjectFile<ELFT>::getFileFormatName() const {
       return "elf32-sparc";
     case ELF::EM_AMDGPU:
       return "elf32-amdgpu";
+    case ELF::EM_OPU:
+      return "elf32-opu";
     default:
       return "elf32-unknown";
     }
@@ -1220,6 +1222,8 @@ StringRef ELFObjectFile<ELFT>::getFileFormatName() const {
       return "elf64-mips";
     case ELF::EM_AMDGPU:
       return "elf64-amdgpu";
+    case ELF::EM_OPU:
+      return "elf64-opu";
     case ELF::EM_BPF:
       return "elf64-bpf";
     case ELF::EM_VE:
@@ -1300,6 +1304,13 @@ template <class ELFT> Triple::ArchType ELFObjectFile<ELFT>::getArch() const {
 
     return Triple::UnknownArch;
   }
+
+  case ELF::EM_OPU: {
+    if (!IsLittleEndian)
+      return Triple::UnknownArch;
+    return Triple::opu;
+  }
+
 
   case ELF::EM_BPF:
     return IsLittleEndian ? Triple::bpfel : Triple::bpfeb;
