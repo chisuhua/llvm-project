@@ -360,6 +360,8 @@ Optional<StringRef> ELFObjectFileBase::tryGetCPUName() const {
   switch (getEMachine()) {
   case ELF::EM_AMDGPU:
     return getAMDGPUCPUName();
+  case ELF::EM_OPU:
+    return getOPUCPUName();
   default:
     return None;
   }
@@ -485,6 +487,18 @@ StringRef ELFObjectFileBase::getAMDGPUCPUName() const {
     return "gfx1035";
   default:
     llvm_unreachable("Unknown EF_AMDGPU_MACH value");
+  }
+}
+
+StringRef ELFObjectFileBase::getOPUCPUName() const {
+  assert(getEMachine() == ELF::EM_OPU);
+  unsigned CPU = getPlatformFlags() & ELF::EF_OPU_MACH;
+
+  switch (CPU) {
+  case ELF::EF_OPU:
+    return "opu";
+  default:
+    llvm_unreachable("Unknown EF_OPU_MACH value");
   }
 }
 

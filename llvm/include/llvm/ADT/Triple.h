@@ -70,6 +70,7 @@ public:
     ppc64le,        // PPC64LE: powerpc64le
     r600,           // R600: AMD GPUs HD2XXX - HD6XXX
     amdgcn,         // AMDGCN: AMD GCN GPUs
+    opu,            // OPU
     riscv32,        // RISC-V (32-bit): riscv32
     riscv64,        // RISC-V (64-bit): riscv64
     sparc,          // Sparc: sparc
@@ -830,6 +831,11 @@ public:
   bool isX32() const {
     EnvironmentType Env = getEnvironment();
     return Env == Triple::GNUX32 || Env == Triple::MuslX32;
+  }
+
+  /// Tests whether the target is OPU
+  bool isOPU() const {
+    return getArch() == Triple::opu;
   }
 
   /// Tests whether the target supports comdat

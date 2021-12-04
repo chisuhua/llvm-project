@@ -1862,6 +1862,8 @@ bool LLParser::parseOptionalCallingConv(unsigned &CC) {
   case lltok::kw_amdgpu_ps:      CC = CallingConv::AMDGPU_PS; break;
   case lltok::kw_amdgpu_cs:      CC = CallingConv::AMDGPU_CS; break;
   case lltok::kw_amdgpu_kernel:  CC = CallingConv::AMDGPU_KERNEL; break;
+  case lltok::kw_opu_kernel:     CC = CallingConv::OPU_KERNEL; break;
+  case lltok::kw_opu_device:     CC = CallingConv::OPU_DEVICE; break;
   case lltok::kw_tailcc:         CC = CallingConv::Tail; break;
   case lltok::kw_cc: {
       Lex.Lex();

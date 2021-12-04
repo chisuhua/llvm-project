@@ -175,6 +175,7 @@ void ScalarEnumerationTraits<ELFYAML::ELF_NT>::enumeration(
   ECase(NT_AMD_PAL_METADATA);
   // AMDGPU specific notes. (Code Object V3)
   ECase(NT_AMDGPU_METADATA);
+  ECase(NT_OPU_METADATA);
 #undef ECase
   IO.enumFallback<Hex32>(Value);
 }
@@ -339,6 +340,7 @@ void ScalarEnumerationTraits<ELFYAML::ELF_EM>::enumeration(
   ECase(EM_78KOR);
   ECase(EM_56800EX);
   ECase(EM_AMDGPU);
+  ECase(EM_OPU);
   ECase(EM_RISCV);
   ECase(EM_LANAI);
   ECase(EM_BPF);
@@ -817,6 +819,9 @@ void ScalarEnumerationTraits<ELFYAML::ELF_REL>::enumeration(
   case ELF::EM_ARC:
 #include "llvm/BinaryFormat/ELFRelocs/ARC.def"
     break;
+  case ELF::EM_OPU:
+#include "llvm/BinaryFormat/ELFRelocs/OPU.def"
+    break;
   case ELF::EM_RISCV:
 #include "llvm/BinaryFormat/ELFRelocs/RISCV.def"
     break;
@@ -825,6 +830,9 @@ void ScalarEnumerationTraits<ELFYAML::ELF_REL>::enumeration(
     break;
   case ELF::EM_AMDGPU:
 #include "llvm/BinaryFormat/ELFRelocs/AMDGPU.def"
+    break;
+  case ELF::EM_OPU:
+#include "llvm/BinaryFormat/ELFRelocs/OPU.def"
     break;
   case ELF::EM_BPF:
 #include "llvm/BinaryFormat/ELFRelocs/BPF.def"

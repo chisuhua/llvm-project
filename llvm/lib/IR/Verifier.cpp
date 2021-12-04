@@ -2436,6 +2436,8 @@ void Verifier::visitFunction(const Function &F) {
   case CallingConv::Intel_OCL_BI:
   case CallingConv::PTX_Kernel:
   case CallingConv::PTX_Device:
+  case CallingConv::OPU_KERNEL:
+  case CallingConv::OPU_DEVICE:
     Assert(!F.isVarArg(), "Calling convention does not support varargs or "
                           "perfect forwarding!",
            &F);

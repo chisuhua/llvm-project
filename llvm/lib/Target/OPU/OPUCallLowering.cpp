@@ -1,0 +1,644 @@
+//===-- llvm/lib/Target/OPU/OPUCallLowering.cpp - Call lowering -----===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+///
+/// \file
+/// This file implements the lowering of LLVM calls to machine code calls for
+/// GlobalISel.
+///
+//===----------------------------------------------------------------------===//
+
+#include "OPUCallLowering.h"
+#include "OPU.h"
+#include "OPUISelLowering.h"
+#include "OPUSubtarget.h"
+#include "OPUMachineFunction.h"
+#include "OPURegisterInfo.h"
+#include "MCTargetDesc/OPUMCTargetDesc.h"
+#include "llvm/CodeGen/Analysis.h"
+#include "llvm/CodeGen/CallingConvLower.h"
+#include "llvm/CodeGen/GlobalISel/MachineIRBuilder.h"
+#include "llvm/CodeGen/MachineInstrBuilder.h"
+#include "llvm/Support/LowLevelTypeImpl.h"
+
+using namespace llvm;
+
+namespace {
+
+struct OutgoingArgHandler : public CallLowering::ValueHandler {
+  OutgoingArgHandler(MachineIRBuilder &MIRBuilder, MachineRegisterInfo &MRI,
+                     MachineInstrBuilder MIB, CCAssignFn *AssignFn)
+      : ValueHandler(MIRBuilder, MRI, AssignFn), MIB(MIB) {}
+
+  MachineInstrBuilder MIB;
+
+  Register getStackAddress(uint64_t Size, int64_t Offset,
+                           MachinePointerInfo &MPO) override {
+    llvm_unreachable("not implemented");
+  }
+
+  void assignValueToAddress(Register ValVReg, Register Addr, uint64_t Size,
+                            MachinePointerInfo &MPO, CCValAssign &VA) override {
+    llvm_unreachable("not implemented");
+  }
+
+  void assignValueToReg(Register ValVReg, Register PhysReg,
+                        CCValAssign &VA) override {
+    MIB.addUse(PhysReg);
+    MIRBuilder.buildCopy(PhysReg, ValVReg);
+  }
+
+  bool assignArg(unsigned ValNo, MVT ValVT, MVT LocVT,
+                 CCValAssign::LocInfo LocInfo,
+                 const CallLowering::ArgInfo &Info,
+                 CCState &State) override {
+    return AssignFn(ValNo, ValVT, LocVT, LocInfo, Info.Flags, State);
+  }
+};
+
+struct IncomingArgHandler : public CallLowering::ValueHandler {
+  uint64_t StackUsed = 0;
+
+  IncomingArgHandler(MachineIRBuilder &MIRBuilder, MachineRegisterInfo &MRI,
+                     CCAssignFn *AssignFn)
+    : ValueHandler(MIRBuilder, MRI, AssignFn) {}
+
+  Register getStackAddress(uint64_t Size, int64_t Offset,
+                           MachinePointerInfo &MPO) override {
+    auto &MFI = MIRBuilder.getMF().getFrameInfo();
+    int FI = MFI.CreateFixedObject(Size, Offset, true);
+    MPO = MachinePointerInfo::getFixedStack(MIRBuilder.getMF(), FI);
+    Register AddrReg = MRI.createGenericVirtualRegister(
+      LLT::pointer(OPUAS::PRIVATE_ADDRESS, 32));
+    MIRBuilder.buildFrameIndex(AddrReg, FI);
+    StackUsed = std::max(StackUsed, Size + Offset);
+    return AddrReg;
+  }
+
+  void assignValueToReg(Register ValVReg, Register PhysReg,
+                        CCValAssign &VA) override {
+    markPhysRegUsed(PhysReg);
+
+    if (VA.getLocVT().getSizeInBits() < 32) {
+      // 16-bit types are reported as legal for 32-bit registers. We need to do
+      // a 32-bit copy, and truncate to avoid the verifier complaining about it.
+      auto Copy = MIRBuilder.buildCopy(LLT::scalar(32), PhysReg);
+      MIRBuilder.buildTrunc(ValVReg, Copy);
+      return;
+    }
+
+    switch (VA.getLocInfo()) {
+    case CCValAssign::LocInfo::SExt:
+    case CCValAssign::LocInfo::ZExt:
+    case CCValAssign::LocInfo::AExt: {
+      auto Copy = MIRBuilder.buildCopy(LLT{VA.getLocVT()}, PhysReg);
+      MIRBuilder.buildTrunc(ValVReg, Copy);
+      break;
+    }
+    default:
+      MIRBuilder.buildCopy(ValVReg, PhysReg);
+      break;
+    }
+  }
+
+  void assignValueToAddress(Register ValVReg, Register Addr, uint64_t Size,
+                            MachinePointerInfo &MPO, CCValAssign &VA) override {
+    // FIXME: Get alignment
+    auto MMO = MIRBuilder.getMF().getMachineMemOperand(
+      MPO, MachineMemOperand::MOLoad | MachineMemOperand::MOInvariant, Size, 1);
+    MIRBuilder.buildLoad(ValVReg, Addr, *MMO);
+  }
+
+  /// How the physical register gets marked varies between formal
+  /// parameters (it's a basic-block live-in), and a call instruction
+  /// (it's an implicit-def of the BL).
+  virtual void markPhysRegUsed(unsigned PhysReg) = 0;
+
+  // FIXME: What is the point of this being a callback?
+  bool isArgumentHandler() const override { return true; }
+};
+
+struct FormalArgHandler : public IncomingArgHandler {
+  FormalArgHandler(MachineIRBuilder &MIRBuilder, MachineRegisterInfo &MRI,
+                   CCAssignFn *AssignFn)
+    : IncomingArgHandler(MIRBuilder, MRI, AssignFn) {}
+
+  void markPhysRegUsed(unsigned PhysReg) override {
+    MIRBuilder.getMBB().addLiveIn(PhysReg);
+  }
+};
+
+}
+
+OPUCallLowering::OPUCallLowering(const OPUTargetLowering &TLI)
+  : CallLowering(&TLI) {
+}
+
+void OPUCallLowering::splitToValueTypes(
+    const ArgInfo &OrigArg, SmallVectorImpl<ArgInfo> &SplitArgs,
+    const DataLayout &DL, MachineRegisterInfo &MRI, CallingConv::ID CallConv,
+    SplitArgTy PerformArgSplit) const {
+  const OPUTargetLowering &TLI = *getTLI<OPUTargetLowering>();
+  LLVMContext &Ctx = OrigArg.Ty->getContext();
+
+  if (OrigArg.Ty->isVoidTy())
+    return;
+
+  SmallVector<EVT, 4> SplitVTs;
+  ComputeValueVTs(TLI, DL, OrigArg.Ty, SplitVTs);
+
+  assert(OrigArg.Regs.size() == SplitVTs.size());
+
+  int SplitIdx = 0;
+  for (EVT VT : SplitVTs) {
+    unsigned NumParts = TLI.getNumRegistersForCallingConv(Ctx, CallConv, VT);
+    Type *Ty = VT.getTypeForEVT(Ctx);
+
+
+
+    if (NumParts == 1) {
+      // No splitting to do, but we want to replace the original type (e.g. [1 x
+      // double] -> double).
+      SplitArgs.emplace_back(OrigArg.Regs[SplitIdx], Ty,
+                             OrigArg.Flags, OrigArg.IsFixed);
+
+      ++SplitIdx;
+      continue;
+    }
+
+    LLT LLTy = getLLTForType(*Ty, DL);
+
+    SmallVector<Register, 8> SplitRegs;
+
+    EVT PartVT = TLI.getRegisterTypeForCallingConv(Ctx, CallConv, VT);
+    Type *PartTy = PartVT.getTypeForEVT(Ctx);
+    LLT PartLLT = getLLTForType(*PartTy, DL);
+
+    // FIXME: Should we be reporting all of the part registers for a single
+    // argument, and let handleAssignments take care of the repacking?
+    for (unsigned i = 0; i < NumParts; ++i) {
+      Register PartReg = MRI.createGenericVirtualRegister(PartLLT);
+      SplitRegs.push_back(PartReg);
+      SplitArgs.emplace_back(ArrayRef<Register>(PartReg), PartTy, OrigArg.Flags);
+    }
+
+    PerformArgSplit(SplitRegs, LLTy, PartLLT, SplitIdx);
+
+    ++SplitIdx;
+  }
+}
+
+bool OPUCallLowering::lowerReturn(MachineIRBuilder &MIRBuilder,
+                                     const Value *Val,
+                                     ArrayRef<Register> VRegs) const {
+
+  MachineFunction &MF = MIRBuilder.getMF();
+  MachineRegisterInfo &MRI = MF.getRegInfo();
+  OPUMachineFunctionInfo *MFI = MF.getInfo<OPUMachineFunctionInfo>();
+  MFI->setIfReturnsVoid(!Val);
+
+  if (!Val) {
+    MIRBuilder.buildInstr(OPU::S_ENDPGM).addImm(0);
+    return true;
+  }
+
+  Register VReg = VRegs[0];
+
+  const Function &F = MF.getFunction();
+  auto &DL = F.getParent()->getDataLayout();
+  if (!OPU::isShader(F.getCallingConv()))
+    return false;
+
+
+  const OPUTargetLowering &TLI = *getTLI<OPUTargetLowering>();
+  SmallVector<EVT, 4> SplitVTs;
+  SmallVector<uint64_t, 4> Offsets;
+  ArgInfo OrigArg{VReg, Val->getType()};
+  setArgFlags(OrigArg, AttributeList::ReturnIndex, DL, F);
+  ComputeValueVTs(TLI, DL, OrigArg.Ty, SplitVTs, &Offsets, 0);
+
+  SmallVector<ArgInfo, 8> SplitArgs;
+  CCAssignFn *AssignFn = CCAssignFnForReturn(F.getCallingConv(), false);
+  for (unsigned i = 0, e = Offsets.size(); i != e; ++i) {
+    Type *SplitTy = SplitVTs[i].getTypeForEVT(F.getContext());
+    SplitArgs.push_back({VRegs[i], SplitTy, OrigArg.Flags, OrigArg.IsFixed});
+  }
+  auto RetInstr = MIRBuilder.buildInstrNoInsert(OPU::OPU_RETURN_TO_EPILOG);
+  OutgoingArgHandler Handler(MIRBuilder, MRI, RetInstr, AssignFn);
+  if (!handleAssignments(MIRBuilder, SplitArgs, Handler))
+    return false;
+  MIRBuilder.insertInstr(RetInstr);
+
+  return true;
+}
+
+Register OPUCallLowering::lowerParameterPtr(MachineIRBuilder &MIRBuilder,
+                                               Type *ParamTy,
+                                               uint64_t Offset) const {
+
+  MachineFunction &MF = MIRBuilder.getMF();
+  const OPUMachineFunctionInfo *MFI = MF.getInfo<OPUMachineFunctionInfo>();
+  MachineRegisterInfo &MRI = MF.getRegInfo();
+  const Function &F = MF.getFunction();
+  const DataLayout &DL = F.getParent()->getDataLayout();
+  PointerType *PtrTy = PointerType::get(ParamTy, OPUAS::CONSTANT_ADDRESS);
+  LLT PtrType = getLLTForType(*PtrTy, DL);
+  Register DstReg = MRI.createGenericVirtualRegister(PtrType);
+  Register KernArgSegmentPtr =
+    MFI->getPreloadedReg(OPUFunctionArgInfo::KERNARG_SEGMENT_PTR);
+  Register KernArgSegmentVReg = MRI.getLiveInVirtReg(KernArgSegmentPtr);
+
+  Register OffsetReg = MRI.createGenericVirtualRegister(LLT::scalar(64));
+  MIRBuilder.buildConstant(OffsetReg, Offset);
+
+  MIRBuilder.buildGEP(DstReg, KernArgSegmentVReg, OffsetReg);
+
+  return DstReg;
+}
+
+void OPUCallLowering::lowerParameter(MachineIRBuilder &MIRBuilder,
+                                        Type *ParamTy, uint64_t Offset,
+                                        unsigned Align,
+                                        Register DstReg) const {
+  MachineFunction &MF = MIRBuilder.getMF();
+  const Function &F = MF.getFunction();
+  const DataLayout &DL = F.getParent()->getDataLayout();
+  PointerType *PtrTy = PointerType::get(ParamTy, OPUAS::CONSTANT_ADDRESS);
+  MachinePointerInfo PtrInfo(UndefValue::get(PtrTy));
+  unsigned TypeSize = DL.getTypeStoreSize(ParamTy);
+  Register PtrReg = lowerParameterPtr(MIRBuilder, ParamTy, Offset);
+
+  MachineMemOperand *MMO =
+      MF.getMachineMemOperand(PtrInfo, MachineMemOperand::MOLoad |
+                                       MachineMemOperand::MODereferenceable |
+                                       MachineMemOperand::MOInvariant,
+                                       TypeSize, Align);
+
+  MIRBuilder.buildLoad(DstReg, PtrReg, *MMO);
+}
+
+// Allocate special inputs passed in user SGPRs.
+static void allocateHSAUserSGPRs(CCState &CCInfo,
+                                 MachineIRBuilder &MIRBuilder,
+                                 MachineFunction &MF,
+                                 const OPURegisterInfo &TRI,
+                                 OPUMachineFunctionInfo &Info) {
+  // FIXME: How should these inputs interact with inreg / custom SGPR inputs?
+  if (Info.hasPrivateSegmentBuffer()) {
+    unsigned PrivateSegmentBufferReg = Info.addPrivateSegmentBuffer(TRI);
+    MF.addLiveIn(PrivateSegmentBufferReg, &OPU::SGPR_128RegClass);
+    CCInfo.AllocateReg(PrivateSegmentBufferReg);
+  }
+
+  if (Info.hasDispatchPtr()) {
+    unsigned DispatchPtrReg = Info.addDispatchPtr(TRI);
+    MF.addLiveIn(DispatchPtrReg, &OPU::SGPR_64RegClass);
+    CCInfo.AllocateReg(DispatchPtrReg);
+  }
+
+  if (Info.hasQueuePtr()) {
+    unsigned QueuePtrReg = Info.addQueuePtr(TRI);
+    MF.addLiveIn(QueuePtrReg, &OPU::SGPR_64RegClass);
+    CCInfo.AllocateReg(QueuePtrReg);
+  }
+
+  if (Info.hasKernargSegmentPtr()) {
+    MachineRegisterInfo &MRI = MF.getRegInfo();
+    Register InputPtrReg = Info.addKernargSegmentPtr(TRI);
+    const LLT P4 = LLT::pointer(OPUAS::CONSTANT_ADDRESS, 64);
+    Register VReg = MRI.createGenericVirtualRegister(P4);
+    MRI.addLiveIn(InputPtrReg, VReg);
+    MIRBuilder.getMBB().addLiveIn(InputPtrReg);
+    MIRBuilder.buildCopy(VReg, InputPtrReg);
+    CCInfo.AllocateReg(InputPtrReg);
+  }
+
+  if (Info.hasDispatchID()) {
+    unsigned DispatchIDReg = Info.addDispatchID(TRI);
+    MF.addLiveIn(DispatchIDReg, &OPU::SGPR_64RegClass);
+    CCInfo.AllocateReg(DispatchIDReg);
+  }
+
+  if (Info.hasFlatScratchInit()) {
+    unsigned FlatScratchInitReg = Info.addFlatScratchInit(TRI);
+    MF.addLiveIn(FlatScratchInitReg, &OPU::SGPR_64RegClass);
+    CCInfo.AllocateReg(FlatScratchInitReg);
+  }
+
+  // TODO: Add GridWorkGroupCount user SGPRs when used. For now with HSA we read
+  // these from the dispatch pointer.
+}
+
+bool OPUCallLowering::lowerFormalArgumentsKernel(
+    MachineIRBuilder &MIRBuilder, const Function &F,
+    ArrayRef<ArrayRef<Register>> VRegs) const {
+  MachineFunction &MF = MIRBuilder.getMF();
+  const OPUSubtarget *Subtarget = &MF.getSubtarget<OPUSubtarget>();
+  MachineRegisterInfo &MRI = MF.getRegInfo();
+  OPUMachineFunctionInfo *Info = MF.getInfo<OPUMachineFunctionInfo>();
+  const OPURegisterInfo *TRI = Subtarget->getRegisterInfo();
+  const OPUTargetLowering &TLI = *getTLI<OPUTargetLowering>();
+
+  const DataLayout &DL = F.getParent()->getDataLayout();
+
+  SmallVector<CCValAssign, 16> ArgLocs;
+  CCState CCInfo(F.getCallingConv(), F.isVarArg(), MF, ArgLocs, F.getContext());
+
+  allocateHSAUserSGPRs(CCInfo, MIRBuilder, MF, *TRI, *Info);
+
+  unsigned i = 0;
+  const unsigned KernArgBaseAlign = 16;
+  const unsigned BaseOffset = Subtarget->getExplicitKernelArgOffset(F);
+  uint64_t ExplicitArgOffset = 0;
+
+  // TODO: Align down to dword alignment and extract bits for extending loads.
+  for (auto &Arg : F.args()) {
+    Type *ArgTy = Arg.getType();
+    unsigned AllocSize = DL.getTypeAllocSize(ArgTy);
+    if (AllocSize == 0)
+      continue;
+
+    unsigned ABIAlign = DL.getABITypeAlignment(ArgTy);
+
+    uint64_t ArgOffset = alignTo(ExplicitArgOffset, ABIAlign) + BaseOffset;
+    ExplicitArgOffset = alignTo(ExplicitArgOffset, ABIAlign) + AllocSize;
+
+    ArrayRef<Register> OrigArgRegs = VRegs[i];
+    Register ArgReg =
+      OrigArgRegs.size() == 1
+      ? OrigArgRegs[0]
+      : MRI.createGenericVirtualRegister(getLLTForType(*ArgTy, DL));
+    unsigned Align = MinAlign(KernArgBaseAlign, ArgOffset);
+    ArgOffset = alignTo(ArgOffset, DL.getABITypeAlignment(ArgTy));
+    lowerParameter(MIRBuilder, ArgTy, ArgOffset, Align, ArgReg);
+    if (OrigArgRegs.size() > 1)
+      unpackRegs(OrigArgRegs, ArgReg, ArgTy, MIRBuilder);
+    ++i;
+  }
+
+  TLI.allocateSpecialEntryInputVGPRs(CCInfo, MF, *TRI, *Info);
+  TLI.allocateSystemSGPRs(CCInfo, MF, *Info, F.getCallingConv(), false);
+  return true;
+}
+
+static void packSplitRegsToOrigType(MachineIRBuilder &MIRBuilder,
+                                    ArrayRef<Register> OrigRegs,
+                                    ArrayRef<Register> Regs,
+                                    LLT LLTy,
+                                    LLT PartLLT) {
+  if (!LLTy.isVector() && !PartLLT.isVector()) {
+    MIRBuilder.buildMerge(OrigRegs[0], Regs);
+    return;
+  }
+
+  if (LLTy.isVector() && PartLLT.isVector()) {
+    assert(LLTy.getElementType() == PartLLT.getElementType());
+
+    int DstElts = LLTy.getNumElements();
+    int PartElts = PartLLT.getNumElements();
+    if (DstElts % PartElts == 0)
+      MIRBuilder.buildConcatVectors(OrigRegs[0], Regs);
+    else {
+      // Deal with v3s16 split into v2s16
+      assert(PartElts == 2 && DstElts % 2 != 0);
+      int RoundedElts = PartElts * ((DstElts + PartElts - 1) / PartElts);
+
+      LLT RoundedDestTy = LLT::vector(RoundedElts, PartLLT.getElementType());
+      auto RoundedConcat = MIRBuilder.buildConcatVectors(RoundedDestTy, Regs);
+      MIRBuilder.buildExtract(OrigRegs[0], RoundedConcat, 0);
+    }
+
+    return;
+  }
+
+  assert(LLTy.isVector() && !PartLLT.isVector());
+
+  LLT DstEltTy = LLTy.getElementType();
+  if (DstEltTy == PartLLT) {
+    // Vector was trivially scalarized.
+    MIRBuilder.buildBuildVector(OrigRegs[0], Regs);
+  } else if (DstEltTy.getSizeInBits() > PartLLT.getSizeInBits()) {
+    // Deal with vector with 64-bit elements decomposed to 32-bit
+    // registers. Need to create intermediate 64-bit elements.
+    SmallVector<Register, 8> EltMerges;
+    int PartsPerElt = DstEltTy.getSizeInBits() / PartLLT.getSizeInBits();
+
+    assert(DstEltTy.getSizeInBits() % PartLLT.getSizeInBits() == 0);
+
+    for (int I = 0, NumElts = LLTy.getNumElements(); I != NumElts; ++I)  {
+      auto Merge = MIRBuilder.buildMerge(DstEltTy,
+                                         Regs.take_front(PartsPerElt));
+      EltMerges.push_back(Merge.getReg(0));
+      Regs = Regs.drop_front(PartsPerElt);
+    }
+
+    MIRBuilder.buildBuildVector(OrigRegs[0], EltMerges);
+  } else {
+    // Vector was split, and elements promoted to a wider type.
+    LLT BVType = LLT::vector(LLTy.getNumElements(), PartLLT);
+    auto BV = MIRBuilder.buildBuildVector(BVType, Regs);
+    MIRBuilder.buildTrunc(OrigRegs[0], BV);
+  }
+}
+
+bool OPUCallLowering::lowerFormalArguments(
+    MachineIRBuilder &MIRBuilder, const Function &F,
+    ArrayRef<ArrayRef<Register>> VRegs) const {
+  CallingConv::ID CC = F.getCallingConv();
+
+  // The infrastructure for normal calling convention lowering is essentially
+  // useless for kernels. We want to avoid any kind of legalization or argument
+  // splitting.
+  if (CC == CallingConv::OPU_KERNEL)
+    return lowerFormalArgumentsKernel(MIRBuilder, F, VRegs);
+
+  // OPU_GS and AMDGP_HS are not supported yet.
+  if (CC == CallingConv::OPU_GS || CC == CallingConv::OPU_HS)
+    return false;
+
+  const bool IsShader = OPU::isShader(CC);
+  const bool IsEntryFunc = OPU::isEntryFunctionCC(CC);
+
+  MachineFunction &MF = MIRBuilder.getMF();
+  MachineBasicBlock &MBB = MIRBuilder.getMBB();
+  MachineRegisterInfo &MRI = MF.getRegInfo();
+  OPUMachineFunctionInfo *Info = MF.getInfo<OPUMachineFunctionInfo>();
+  const OPUSubtarget &Subtarget = MF.getSubtarget<OPUSubtarget>();
+  const OPURegisterInfo *TRI = Subtarget.getRegisterInfo();
+  const DataLayout &DL = F.getParent()->getDataLayout();
+
+
+  SmallVector<CCValAssign, 16> ArgLocs;
+  CCState CCInfo(CC, F.isVarArg(), MF, ArgLocs, F.getContext());
+
+  if (Info->hasImplicitBufferPtr()) {
+    Register ImplicitBufferPtrReg = Info->addImplicitBufferPtr(*TRI);
+    MF.addLiveIn(ImplicitBufferPtrReg, &OPU::SGPR_64RegClass);
+    CCInfo.AllocateReg(ImplicitBufferPtrReg);
+  }
+
+
+  SmallVector<ArgInfo, 32> SplitArgs;
+  unsigned Idx = 0;
+  unsigned PSInputNum = 0;
+
+  for (auto &Arg : F.args()) {
+    if (DL.getTypeStoreSize(Arg.getType()) == 0)
+      continue;
+
+    const bool InReg = Arg.hasAttribute(Attribute::InReg);
+
+    // SGPR arguments to functions not implemented.
+    if (!IsShader && InReg)
+      return false;
+
+    // TODO: Handle sret.
+    if (Arg.hasAttribute(Attribute::StructRet) ||
+        Arg.hasAttribute(Attribute::SwiftSelf) ||
+        Arg.hasAttribute(Attribute::SwiftError) ||
+        Arg.hasAttribute(Attribute::Nest))
+      return false;
+
+    if (CC == CallingConv::OPU_PS && !InReg && PSInputNum <= 15) {
+      const bool ArgUsed = !Arg.use_empty();
+      bool SkipArg = !ArgUsed && !Info->isPSInputAllocated(PSInputNum);
+
+      if (!SkipArg) {
+        Info->markPSInputAllocated(PSInputNum);
+        if (ArgUsed)
+          Info->markPSInputEnabled(PSInputNum);
+      }
+
+      ++PSInputNum;
+
+      if (SkipArg) {
+        for (int I = 0, E = VRegs[Idx].size(); I != E; ++I)
+          MIRBuilder.buildUndef(VRegs[Idx][I]);
+
+        ++Idx;
+        continue;
+      }
+    }
+
+    ArgInfo OrigArg(VRegs[Idx], Arg.getType());
+    setArgFlags(OrigArg, Idx + AttributeList::FirstArgIndex, DL, F);
+
+    splitToValueTypes(
+      OrigArg, SplitArgs, DL, MRI, CC,
+      // FIXME: We should probably be passing multiple registers to
+      // handleAssignments to do this
+      [&](ArrayRef<Register> Regs, LLT LLTy, LLT PartLLT, int VTSplitIdx) {
+        packSplitRegsToOrigType(MIRBuilder, VRegs[Idx][VTSplitIdx], Regs,
+                                LLTy, PartLLT);
+      });
+
+    ++Idx;
+  }
+
+  // At least one interpolation mode must be enabled or else the GPU will
+  // hang.
+  //
+  // Check PSInputAddr instead of PSInputEnable. The idea is that if the user
+  // set PSInputAddr, the user wants to enable some bits after the compilation
+  // based on run-time states. Since we can't know what the final PSInputEna
+  // will look like, so we shouldn't do anything here and the user should take
+  // responsibility for the correct programming.
+  //
+  // Otherwise, the following restrictions apply:
+  // - At least one of PERSP_* (0xF) or LINEAR_* (0x70) must be enabled.
+  // - If POS_W_FLOAT (11) is enabled, at least one of PERSP_* must be
+  //   enabled too.
+  if (CC == CallingConv::OPU_PS) {
+    if ((Info->getPSInputAddr() & 0x7F) == 0 ||
+        ((Info->getPSInputAddr() & 0xF) == 0 &&
+         Info->isPSInputAllocated(11))) {
+      CCInfo.AllocateReg(OPU::VGPR0);
+      CCInfo.AllocateReg(OPU::VGPR1);
+      Info->markPSInputAllocated(0);
+      Info->markPSInputEnabled(0);
+    }
+
+    if (Subtarget.isAmdPalOS()) {
+      // For isAmdPalOS, the user does not enable some bits after compilation
+      // based on run-time states; the register values being generated here are
+      // the final ones set in hardware. Therefore we need to apply the
+      // workaround to PSInputAddr and PSInputEnable together.  (The case where
+      // a bit is set in PSInputAddr but not PSInputEnable is where the frontend
+      // set up an input arg for a particular interpolation mode, but nothing
+      // uses that input arg. Really we should have an earlier pass that removes
+      // such an arg.)
+      unsigned PsInputBits = Info->getPSInputAddr() & Info->getPSInputEnable();
+      if ((PsInputBits & 0x7F) == 0 ||
+          ((PsInputBits & 0xF) == 0 &&
+           (PsInputBits >> 11 & 1)))
+        Info->markPSInputEnabled(
+          countTrailingZeros(Info->getPSInputAddr(), ZB_Undefined));
+    }
+  }
+
+  const SITargetLowering &TLI = *getTLI<SITargetLowering>();
+  CCAssignFn *AssignFn = TLI.CCAssignFnForCall(CC, F.isVarArg());
+
+  if (!MBB.empty())
+    MIRBuilder.setInstr(*MBB.begin());
+
+  FormalArgHandler Handler(MIRBuilder, MRI, AssignFn);
+  if (!handleAssignments(CCInfo, ArgLocs, MIRBuilder, SplitArgs, Handler))
+    return false;
+
+  if (!IsEntryFunc) {
+    // Special inputs come after user arguments.
+    TLI.allocateSpecialInputVGPRs(CCInfo, MF, *TRI, *Info);
+  }
+
+  // Start adding system SGPRs.
+  if (IsEntryFunc) {
+    TLI.allocateSystemSGPRs(CCInfo, MF, *Info, CC, IsShader);
+  } else {
+    CCInfo.AllocateReg(Info->getScratchRSrcReg());
+    CCInfo.AllocateReg(Info->getScratchWaveOffsetReg());
+    CCInfo.AllocateReg(Info->getFrameOffsetReg());
+    TLI.allocateSpecialInputSGPRs(CCInfo, MF, *TRI, *Info);
+  }
+
+  // Move back to the end of the basic block.
+  MIRBuilder.setMBB(MBB);
+
+  return true;
+}
+
+bool OPUCallLowering::CCAssignFnForCall(CallingConv::ID CC, bool IsVarArg) const {
+  switch (CC) {
+    case CallingConv::OPU_KERNEL:
+    case CallingConv::PTX_KERNEL:
+        llvm_unreachable("kernels should not be handled here");
+    case CallingConv::OPU_DEVICE:
+    case CallingConv::PTX_DEVICE:
+    case CallingConv::C:
+    case CallingConv::Fast:
+    case CallingConv::Cold:
+        return CC_OPU_Func;
+    default:
+        report_fatal_error("Unsupported calling convention");
+  }
+}
+
+bool OPUCallLowering::CCAssignFnForReturn(CallingConv::ID CC, bool IsVarArg) const {
+  switch (CC) {
+    case CallingConv::OPU_KERNEL:
+    case CallingConv::PTX_KERNEL:
+        llvm_unreachable("kernels should not be handled here");
+    case CallingConv::OPU_DEVICE:
+    case CallingConv::PTX_DEVICE:
+    case CallingConv::C:
+    case CallingConv::Fast:
+    case CallingConv::Cold:
+        return RetCC_OPU_Func;
+    default:
+        report_fatal_error("Unsupported calling convention");
+  }
+}
